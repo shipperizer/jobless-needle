@@ -8,10 +8,11 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/shipperizer/jobless-needle/tasker"
+	"github.com/shipperizer/jobless-needle/threadpool"
 
 	chi "github.com/go-chi/chi/v5"
 	"github.com/kelseyhightower/envconfig"
@@ -19,7 +20,7 @@ import (
 )
 
 type EnvSpec struct {
-	Port int `envconfig:"port"`
+	Port int `envconfig:"port" default:"8000"`
 }
 
 func main() {
@@ -35,25 +36,37 @@ func main() {
 		logger = log.Sugar()
 	}
 
-	runner := tasker.NewRunner(500, logger)
+	tp := threadpool.NewThreadPool()
 
 	router := chi.NewMux()
 
-	router.Get("/api/v0/counter/{limit:[0-9]+}", func(w http.ResponseWriter, r *http.Request) {
+	router.Get("/api/v0/tp/{limit:[0-9]+}", func(w http.ResponseWriter, r *http.Request) {
 		limit, _ := strconv.Atoi(chi.URLParam(r, "limit"))
+		wg := sync.WaitGroup{}
+		c := make(chan *threadpool.TaskResult[any], limit)
 
-		nums := runner.SubmitJob(r.Context(), limit, 10)
+		wg.Add(limit)
+
+		for i := 0; i < limit; i++ {
+			_ = tp.Submit(fmt.Sprintf("Task-%d", i), func() any { return i }, c, &wg)
+		}
+
+		wg.Wait()
+
+		var results []threadpool.TaskResult[int]
+
+		results = threadpool.Take[int](c, limit)
+		close(c)
 
 		w.WriteHeader(http.StatusOK)
 
-		json.NewEncoder(w).Encode(
+		_ = json.NewEncoder(w).Encode(
 			map[string]string{
-				"count":  fmt.Sprintf("%v", len(nums)),
-				"data":   fmt.Sprintf("%v", nums),
+				"count":  fmt.Sprintf("%v", len(results)),
+				"data":   fmt.Sprintf("%+v", results),
 				"status": fmt.Sprintf("%v", http.StatusOK),
 			},
 		)
-
 	})
 
 	srv := &http.Server{
@@ -82,7 +95,7 @@ func main() {
 	// Doesn't block if no connections, but will otherwise wait
 	// until the timeout deadline.
 	srv.Shutdown(ctx)
-	runner.Shutdown()
+	tp.Stop()
 
 	logger.Desugar().Sync()
 
