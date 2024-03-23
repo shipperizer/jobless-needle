@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"sync"
 	"sync/atomic"
 )
@@ -11,6 +12,22 @@ import (
 const (
 	ContextDoneMsg = "ThreadPool context done"
 )
+
+type TaskJob struct {
+	taskID  string
+	command any
+	results chan<- *TaskResult[any]
+	wg      *sync.WaitGroup
+}
+
+func NewTaskJob(taskID string, command any, results chan<- *TaskResult[any], wg *sync.WaitGroup) *TaskJob {
+	return &TaskJob{
+		taskID:  taskID,
+		command: command,
+		results: results,
+		wg:      wg,
+	}
+}
 
 type TaskResult[T any] struct {
 	key   string
@@ -33,13 +50,14 @@ func NewTaskResult[T any](taskID string, result T) *TaskResult[T] {
 type ThreadPool struct {
 	cancel    context.CancelFunc
 	done      <-chan struct{}
+	jobs      chan *TaskJob
 	stopped   *atomic.Bool
 	mainGroup *sync.WaitGroup
 }
 
 func (t *ThreadPool) Stop() {
-	t.stopped.Swap(true)
 	t.cancel()
+	t.stopped.Swap(true)
 }
 
 func (t *ThreadPool) Await() {
@@ -55,13 +73,36 @@ func (t *ThreadPool) Submit(taskID string, command any, results chan<- *TaskResu
 		return fmt.Errorf("ThreadPool is stopped")
 	}
 
-	go t.worker(taskID, command, results, wg)()
-	return nil
+	select {
+	case t.jobs <- NewTaskJob(taskID, command, results, wg):
+		return nil
+	default:
+		return fmt.Errorf("ThreadPool queue is full")
+	}
 }
 
-func (t *ThreadPool) worker(taskID string, command any, results chan<- *TaskResult[any], wg *sync.WaitGroup) func() {
+func (t *ThreadPool) setupWorkers(n int) {
+	t.mainGroup.Add(n)
+	for i := 0; i < n; i++ {
+		go t.worker(strconv.Itoa(i))()
+	}
+}
+
+func (t *ThreadPool) worker(workerID string) func() {
+	id := fmt.Sprintf("worker-%s", workerID)
 	return func() {
-		t.executeFunc(taskID, command, results, wg)
+		log.Printf("Started worker '%s'\n", id)
+		for {
+			select {
+			case <-t.Done():
+				log.Println(ContextDoneMsg)
+				log.Printf("Exiting worker '%s'\n", id)
+				t.mainGroup.Done()
+				return
+			case task := <-t.jobs:
+				t.executeFunc(task.taskID, task.command, task.results, task.wg)
+			}
+		}
 	}
 }
 
@@ -74,9 +115,6 @@ func (t *ThreadPool) executeFunc(taskID string, processor any, results chan<- *T
 	case <-t.done:
 		log.Println(ContextDoneMsg)
 	default:
-		t.mainGroup.Add(1)
-		defer t.mainGroup.Done()
-
 		switch task := processor.(type) {
 		case func():
 			task()
@@ -88,28 +126,36 @@ func (t *ThreadPool) executeFunc(taskID string, processor any, results chan<- *T
 	}
 }
 
-func NewThreadPool() *ThreadPool {
+func NewThreadPool(workers, queueSize int) *ThreadPool {
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	stopped := atomic.Bool{}
 	stopped.Store(false)
-	return &ThreadPool{
+	tp := &ThreadPool{
 		done:      ctx.Done(),
+		jobs:      make(chan *TaskJob, queueSize),
 		cancel:    cancelFunc,
 		stopped:   &stopped,
 		mainGroup: &sync.WaitGroup{},
 	}
+
+	tp.setupWorkers(workers)
+	return tp
 }
 
-func NewThreadPoolWithContext(ctx context.Context) *ThreadPool {
+func NewThreadPoolWithContext(ctx context.Context, workers, queueSize int) *ThreadPool {
 	ctx, cancelFunc := context.WithCancel(ctx)
 	stopped := atomic.Bool{}
 	stopped.Store(false)
-	return &ThreadPool{
+	tp := &ThreadPool{
 		done:      ctx.Done(),
+		jobs:      make(chan *TaskJob, queueSize),
 		cancel:    cancelFunc,
 		stopped:   &stopped,
 		mainGroup: &sync.WaitGroup{},
 	}
+
+	tp.setupWorkers(workers)
+	return tp
 }
 
 func Take[T any](results chan *TaskResult[any], n int) []TaskResult[T] {

@@ -36,7 +36,7 @@ func main() {
 		logger = log.Sugar()
 	}
 
-	tp := threadpool.NewThreadPool()
+	tp := threadpool.NewThreadPool(500, 500)
 
 	router := chi.NewMux()
 
