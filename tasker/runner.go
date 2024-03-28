@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	"go.uber.org/zap"
 )
@@ -12,7 +11,7 @@ import (
 type Job struct {
 	Context context.Context
 	Limit   int
-	ChData  chan int
+	ChData  chan []int
 	ChDone  chan bool
 }
 
@@ -38,13 +37,14 @@ func (r *Runner) Shutdown() {
 	r.wg.Wait()
 
 }
+
 func (r *Runner) SubmitJob(ctx context.Context, limit, workers int) []int {
 
-	data := make(chan int)
+	data := make(chan []int)
 	done := make(chan bool, workers)
 
 	// ensures the order
-	r.lock.Lock()
+	// r.lock.Lock()
 	for i := 0; i < workers; i++ {
 		r.chJob <- Job{
 			Context: ctx,
@@ -53,7 +53,7 @@ func (r *Runner) SubmitJob(ctx context.Context, limit, workers int) []int {
 			ChDone:  done,
 		}
 	}
-	r.lock.Unlock()
+	// r.lock.Unlock()
 
 	nums := make([]int, 0)
 
@@ -69,33 +69,22 @@ func (r *Runner) SubmitJob(ctx context.Context, limit, workers int) []int {
 			if !ok {
 				fmt.Println("channel closed")
 			}
-			nums = append(nums, num)
+			nums = append(nums, num...)
 		default:
-			if cap(done) != len(done) {
-				continue
+			if cap(done) == len(done) {
+
+				close(data)
+				close(done)
+				// r.inspectResults(done)
+				return nums
 			}
 
-			close(data)
-			close(done)
-			r.inspectResults(done)
-			return nums
-
 		}
 	}
 
 }
 
-func (r *Runner) inspectResults(chDone chan bool) {
-	for result := range chDone {
-		if result {
-			fmt.Println("successful")
-		} else {
-			fmt.Println("unsuccessful")
-		}
-	}
-}
-
-func (r *Runner) count(_ context.Context, x int, chData chan int, chDone chan bool) {
+func (r *Runner) count(_ context.Context, x int, chData chan []int, chDone chan bool) {
 	fmt.Println("count started with ", x)
 	// catch closed channel panic
 	defer func() {
@@ -105,13 +94,11 @@ func (r *Runner) count(_ context.Context, x int, chData chan int, chDone chan bo
 
 	}()
 
+	y := make([]int, 0)
 	for i := 0; i < x; i++ {
-
-		fmt.Println("sending ", i, " to the channel")
-		chData <- i
-
-		fmt.Println("sent ", i, " to the channel")
+		y = append(y, i)
 	}
+	chData <- y
 
 	chDone <- true
 }
@@ -125,7 +112,7 @@ func (r *Runner) consume(ID int) {
 			r.count(job.Context, job.Limit, job.ChData, job.ChDone)
 			fmt.Println(ID, " done job: ", job)
 		case <-r.shutdownCtx.Done():
-			r.status.Store(ID, false)
+			// r.status.Store(ID, false)
 			fmt.Println(ID, " going down")
 			r.wg.Done()
 			return
@@ -143,16 +130,16 @@ func (r *Runner) start() {
 		go r.consume(i)
 	}
 
-	for range time.NewTicker(10 * time.Second).C {
-		fmt.Println("workers status")
-		r.status.Range(
-			func(key, value any) bool {
-				fmt.Printf("ID %v: state %v", key, value)
-				return true
-			},
-		)
-		fmt.Println("job queue length: ", len(r.chJob))
-	}
+	// for range time.NewTicker(10 * time.Second).C {
+	// 	fmt.Println("workers status")
+	// 	r.status.Range(
+	// 		func(key, value any) bool {
+	// 			fmt.Printf("ID %v: state %v", key, value)
+	// 			return true
+	// 		},
+	// 	)
+	// 	fmt.Println("job queue length: ", len(r.chJob))
+	// }
 
 }
 
@@ -163,7 +150,7 @@ func NewRunner(workers int, logger *zap.SugaredLogger) *Runner {
 	r.logger = logger
 
 	r.shutdownCtx, r.shutdownFunc = context.WithCancelCause(context.Background())
-	r.chJob = make(chan Job, 10000)
+	r.chJob = make(chan Job, workers)
 
 	go r.start()
 

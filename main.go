@@ -7,12 +7,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/shipperizer/jobless-needle/threadpool"
+	"github.com/shipperizer/jobless-needle/tasker"
 
 	chi "github.com/go-chi/chi/v5"
 	"github.com/kelseyhightower/envconfig"
@@ -36,38 +35,76 @@ func main() {
 		logger = log.Sugar()
 	}
 
-	tp := threadpool.NewThreadPool(500, 500)
+	// tp := threadpool.NewThreadPool(500, 500)
+
+	// runner := tasker.NewRunner(500, logger)
+	task := tasker.NewTasker(500)
 
 	router := chi.NewMux()
 
-	router.Get("/api/v0/tp/{limit:[0-9]+}", func(w http.ResponseWriter, r *http.Request) {
-		limit, _ := strconv.Atoi(chi.URLParam(r, "limit"))
+	router.Get("/api/v0/roles/{id:.+}/entitlements", func(w http.ResponseWriter, r *http.Request) {
+		ofgaTypes := []string{"role", "group", "identity", "scheme", "provider", "client"}
+		results := make(chan tasker.TaskerResultInterface, len(ofgaTypes))
 		wg := sync.WaitGroup{}
-		c := make(chan *threadpool.TaskResult[any], limit)
+		wg.Add(len(ofgaTypes))
 
-		wg.Add(limit)
-
-		for i := 0; i < limit; i++ {
-			_ = tp.Submit(fmt.Sprintf("Task-%d", i), func() any { return i }, c, &wg)
+		for _, t := range ofgaTypes {
+			task.Go(chi.URLParam(r, "id"), t, results, &wg)
 		}
 
 		wg.Wait()
+		close(results)
 
-		var results []threadpool.TaskResult[int]
+		fmt.Println("closing channel")
 
-		results = threadpool.Take[int](c, limit)
-		close(c)
+		permissions := make([]string, 0)
+
+		for r := range results {
+			v := r.GetValue().(tasker.ListPermissionsResultValue)
+			permissions = append(permissions, v.Permissions...)
+		}
 
 		w.WriteHeader(http.StatusOK)
 
-		_ = json.NewEncoder(w).Encode(
+		json.NewEncoder(w).Encode(
 			map[string]string{
-				"count":  fmt.Sprintf("%v", len(results)),
-				"data":   fmt.Sprintf("%+v", results),
+				"count":  fmt.Sprintf("%v", len(permissions)),
+				"data":   fmt.Sprintf("%v", permissions),
 				"status": fmt.Sprintf("%v", http.StatusOK),
 			},
 		)
+
 	})
+
+	// router.Get("/api/v0/tp/{limit:[0-9]+}", func(w http.ResponseWriter, r *http.Request) {
+	// 	limit, _ := strconv.Atoi(chi.URLParam(r, "limit"))
+	// 	wg := sync.WaitGroup{}
+	// 	c := make(chan *threadpool.TaskResult[any], limit)
+
+	// 	wg.Add(limit)
+
+	// 	for i := 0; i < limit; i++ {
+	// 		_ = tp.Submit(fmt.Sprintf("Task-%d", i),
+	// 			func() any { return i }, c, &wg)
+	// 	}
+
+	// 	wg.Wait()
+
+	// 	var results []threadpool.TaskResult[int]
+
+	// 	results = threadpool.Take[int](c, limit)
+	// 	close(c)
+
+	// 	w.WriteHeader(http.StatusOK)
+
+	// 	_ = json.NewEncoder(w).Encode(
+	// 		map[string]string{
+	// 			"count":  fmt.Sprintf("%v", len(results)),
+	// 			"data":   fmt.Sprintf("%+v", results),
+	// 			"status": fmt.Sprintf("%v", http.StatusOK),
+	// 		},
+	// 	)
+	// })
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf("0.0.0.0:%v", specs.Port),
@@ -95,7 +132,8 @@ func main() {
 	// Doesn't block if no connections, but will otherwise wait
 	// until the timeout deadline.
 	srv.Shutdown(ctx)
-	tp.Stop()
+	task.Shutdown()
+	// tp.Stop()
 
 	logger.Desugar().Sync()
 
